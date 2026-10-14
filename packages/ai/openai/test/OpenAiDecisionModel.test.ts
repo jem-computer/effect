@@ -308,6 +308,49 @@ describe("OpenAiDecisionModel", () => {
     )
   })
 
+  it.effect("receives inline images after the call's images, with [image N] references in their place", () => {
+    const thumb = Decision.image({ mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]) })
+    const Gesture = Decision.make({
+      input: Schema.String,
+      decisions: {
+        gesture: Decision.classify({
+          instructions: "Which gesture is the hand making?",
+          criteria: { thumbs_up: { examples: [thumb] }, none: "No hand" }
+        })
+      }
+    })
+    return Effect.gen(function*() {
+      const { answers } = yield* DecisionModel.decide(Gesture, {
+        input: "Camera frame",
+        images: [{ mediaType: "image/jpeg", data: "/9j/4AAQ" }]
+      })
+      assert.strictEqual(answers.gesture.label, "thumbs_up")
+    }).pipe(
+      Effect.provide(OpenAiDecisionModel.layer({ model: "gpt-6-luna" })),
+      Effect.provide(clientLayer(
+        response([{
+          name: "gesture",
+          type: "choice",
+          choice: "thumbs_up",
+          probabilities: [{ value: "thumbs_up", probability: 0.9 }, { value: "none", probability: 0.1 }],
+          confidence: 0.9
+        }]),
+        (request) => {
+          const body = requestBody(request)
+          assert.deepStrictEqual(body.input[0].content, [
+            { type: "input_text", text: "Camera frame" },
+            { type: "input_image", image_url: "data:image/jpeg;base64,/9j/4AAQ" },
+            { type: "input_image", image_url: "data:image/png;base64,iVBORw==" }
+          ])
+          assert.deepStrictEqual(body.questions[0].choices, [
+            { value: "thumbs_up", description: "{\"examples\":[\"[image 2]\"]}" },
+            { value: "none", description: "No hand" }
+          ])
+        }
+      ))
+    )
+  })
+
   it.effect("rejects remote image URLs without sending a request", () => {
     let requests = 0
     return Effect.gen(function*() {

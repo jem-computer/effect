@@ -778,6 +778,99 @@ describe("TypeSafeDecisionModel", () => {
         ))
       ))
 
+    describe("inline", () => {
+      const thumb = Decision.image({ mediaType: "image/png", data: pngBytes })
+      const palm = Decision.image({ mediaType: "image/jpeg", data: "/9j/4AAQ" })
+      const Gesture = Decision.make({
+        input: Schema.String,
+        decisions: {
+          gesture: Decision.classify({
+            instructions: "Which gesture is the hand in `images[0]` making?",
+            criteria: {
+              thumbs_up: thumb,
+              open_palm: { description: "Palm facing the camera", examples: [palm, thumb] },
+              none: null
+            }
+          })
+        }
+      })
+      const gestureResponse = {
+        model: "jev-1.14.0",
+        answers: {
+          gesture: {
+            type: "choice",
+            choice: "thumbs_up",
+            probabilities: { thumbs_up: 0.9, open_palm: 0.05, none: 0.05 },
+            confidence: 0.9
+          }
+        }
+      }
+
+      it.effect("sends inline images in place, once per distinct image, after the call's images", () =>
+        Effect.gen(function*() {
+          const { answers } = yield* DecisionModel.decide(Gesture, { input: "Camera frame", images: [images[1]] })
+          assert.strictEqual(answers.gesture.label, "thumbs_up")
+        }).pipe(
+          Effect.provide(TypeSafeDecisionModel.layer({ model: "jev-preview" })),
+          Effect.provide(makeClientLayer((request) =>
+            Effect.gen(function*() {
+              const body = yield* getRequestBody(request)
+              const [frame] = body.state.images
+              const { thumbs_up, open_palm } = body.questions.gesture.criteria
+              assert.strictEqual(request.headers["typesafe-danger-zone-images"], "true")
+              assert.deepStrictEqual(body.state, { input: "Camera frame", images: [frame] })
+              assert.deepStrictEqual(body.questions.gesture.criteria, {
+                thumbs_up,
+                open_palm: { description: "Palm facing the camera", examples: [open_palm.examples[0], thumbs_up] },
+                none: null
+              })
+              assert.deepStrictEqual(body.assets, {
+                [frame]: { type: "image", format: "jpg", data_base64: "/9j/4AAQ" },
+                [thumbs_up]: { type: "image", format: "png", data_base64: "iVBORw==" },
+                [open_palm.examples[0]]: { type: "image", format: "jpg", data_base64: "/9j/4AAQ" }
+              })
+              return jsonResponse(request, gestureResponse)
+            })
+          ))
+        ))
+
+      it.effect("keeps the state unwrapped when only inline images are present", () =>
+        Effect.gen(function*() {
+          yield* DecisionModel.decide(Gesture, { input: "Camera frame" })
+        }).pipe(
+          Effect.provide(TypeSafeDecisionModel.layer({ model: "jev-preview" })),
+          Effect.provide(makeClientLayer((request) =>
+            Effect.gen(function*() {
+              const body = yield* getRequestBody(request)
+              assert.strictEqual(body.state, "Camera frame")
+              assert.strictEqual(Object.keys(body.assets).length, 2)
+              assert.strictEqual(request.headers["typesafe-danger-zone-images"], "true")
+              return jsonResponse(request, gestureResponse)
+            })
+          ))
+        ))
+
+      it.effect("rejects an inline WebP image before sending", () =>
+        Effect.gen(function*() {
+          const definition = Decision.make({
+            input: Schema.String,
+            decisions: {
+              same: Decision.probability({
+                instructions: [
+                  "Is this the same product as",
+                  Decision.image({ mediaType: "image/webp", data: "UklGRg==" })
+                ]
+              })
+            }
+          })
+          const error = yield* DecisionModel.decide(definition, { input: "x" }).pipe(Effect.flip)
+          assert.strictEqual(error.reason._tag, "InvalidUserInputError")
+        }).pipe(
+          Effect.provide(TypeSafeDecisionModel.layer({ model: "jev-preview" })),
+          Effect.provide(makeClientLayer(() => Effect.die(new Error("Invalid images must not be sent"))))
+        ))
+    })
+
     for (
       const [name, image] of [
         ["a remote URL", { mediaType: "image/png", data: new URL("https://example.com/mug.png") }],

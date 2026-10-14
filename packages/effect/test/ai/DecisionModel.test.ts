@@ -956,3 +956,177 @@ describe("Locate decisions", () => {
       }))))
   }
 })
+
+describe("Inline images", () => {
+  const thumb = Decision.image({ mediaType: "image/png", data: new Uint8Array([137, 80, 78, 71]) })
+  const palm = Decision.image({ mediaType: "image/jpeg", data: "/9j/4AAQ" })
+
+  const Gesture = Decision.make({
+    input: Schema.String,
+    decisions: {
+      gesture: Decision.classify({
+        instructions: "Which gesture is the hand making?",
+        criteria: {
+          thumbs_up: thumb,
+          open_palm: { description: "Palm facing the camera", examples: [palm, thumb] },
+          none: null
+        }
+      }),
+      relaxed: Decision.probability({ instructions: "The hand is relaxed", criteria: { false: "Tense", true: palm } })
+    }
+  })
+
+  const frame: DecisionModel.Image = { mediaType: "image/png", data: "iVBORw0KGgo=" }
+
+  const gestureAnswers = {
+    gesture: {
+      _tag: "Classify" as const,
+      label: "thumbs_up",
+      probabilities: { thumbs_up: 0.8, open_palm: 0.1, none: 0.1 }
+    },
+    relaxed: { _tag: "Probability" as const, probability: 0.6 }
+  }
+
+  const capture = (
+    params: { readonly supportsImages?: boolean; readonly supportsInlineImages?: boolean },
+    calls: Array<DecisionModel.ProviderOptions>
+  ) =>
+    Layer.effect(
+      DecisionModel.DecisionModel,
+      DecisionModel.make({
+        ...params,
+        decide: (options) => {
+          calls.push(options)
+          return Effect.succeed({ answers: gestureAnswers, usage: { inputTokens: undefined, outputTokens: undefined } })
+        }
+      })
+    )
+
+  it("image stores byte arrays as base64 and URLs as hrefs", () => {
+    assert.deepStrictEqual(thumb, { [Decision.InlineImageKey]: { mediaType: "image/png", base64: "iVBORw==" } })
+    assert.deepStrictEqual(
+      Decision.image({ mediaType: "image/png", data: new URL("https://example.com/a.png") }),
+      { [Decision.InlineImageKey]: { mediaType: "image/png", url: "https://example.com/a.png" } }
+    )
+  })
+
+  it("isInlineImage recognizes only image markers", () => {
+    assert.isTrue(Decision.isInlineImage(thumb))
+    assert.isTrue(Decision.isInlineImage(JSON.parse(JSON.stringify(palm))))
+    assert.isFalse(Decision.isInlineImage({ ...thumb, extra: 1 }))
+    assert.isFalse(Decision.isInlineImage({ [Decision.InlineImageKey]: { mediaType: 1, base64: "" } }))
+    assert.isFalse(Decision.isInlineImage({ [Decision.InlineImageKey]: { mediaType: "image/png" } }))
+    assert.isFalse(Decision.isInlineImage("iVBORw=="))
+  })
+
+  it("mapImages replaces images at any depth and copies everything else", () => {
+    const description = JSON.parse(
+      JSON.stringify({ text: "keep", n: 1, ok: true, none: null, nested: { list: [thumb, { deep: palm }] } })
+    )
+    Object.defineProperty(description, "__proto__", {
+      value: thumb,
+      enumerable: true,
+      configurable: true,
+      writable: true
+    })
+    const seen: Array<{ readonly mediaType: string; readonly data: string | URL }> = []
+    const mapped = Decision.mapImages(description, (image) => {
+      seen.push(image)
+      return `<${seen.length}>`
+    }) as any
+
+    assert.deepStrictEqual(seen, [
+      { mediaType: "image/png", data: "iVBORw==" },
+      { mediaType: "image/jpeg", data: "/9j/4AAQ" },
+      { mediaType: "image/png", data: "iVBORw==" }
+    ])
+    assert.deepStrictEqual(mapped.nested, { list: ["<1>", { deep: "<2>" }] })
+    assert.strictEqual(Object.getOwnPropertyDescriptor(mapped, "__proto__")?.value, "<3>")
+    assert.strictEqual(Object.getPrototypeOf(mapped), Object.prototype)
+    assert.deepStrictEqual([mapped.text, mapped.n, mapped.ok, mapped.none], ["keep", 1, true, null])
+    assert.strictEqual(Decision.mapImages(thumb, () => "whole"), "whole")
+    assert.strictEqual(Decision.mapImages(null, () => "unused"), null)
+    assert.strictEqual(
+      Decision.mapImages(Decision.image({ mediaType: "image/png", data: new URL("data:image/png;base64,AA==") }), (
+        image
+      ) => image.data instanceof URL ? image.data.href : "not a URL"),
+      "data:image/png;base64,AA=="
+    )
+  })
+
+  it.effect("moves inline images after the call's images for models without inline support", () => {
+    const calls: Array<DecisionModel.ProviderOptions> = []
+    return Effect.gen(function*() {
+      const { answers } = yield* DecisionModel.decide(Gesture, { input: "Camera frame", images: [frame] })
+
+      assert.strictEqual(answers.gesture.label, "thumbs_up")
+      assert.deepStrictEqual(calls[0].images, [
+        frame,
+        { mediaType: "image/png", data: "iVBORw==" },
+        { mediaType: "image/jpeg", data: "/9j/4AAQ" }
+      ])
+      const { gesture, relaxed } = calls[0].decisions as any
+      assert.deepStrictEqual({ ...gesture.criteria }, {
+        thumbs_up: "[image 2]",
+        open_palm: { description: "Palm facing the camera", examples: ["[image 3]", "[image 2]"] },
+        none: null
+      })
+      assert.strictEqual(gesture.instructions, "Which gesture is the hand making?")
+      assert.deepStrictEqual(relaxed.criteria, { false: "Tense", true: "[image 3]" })
+      assert.strictEqual(Gesture.decisions.gesture.criteria.thumbs_up, thumb)
+    }).pipe(Effect.provide(capture({ supportsImages: true }, calls)))
+  })
+
+  it.effect("counts moved images from 1 when the call has no images", () => {
+    const calls: Array<DecisionModel.ProviderOptions> = []
+    return Effect.gen(function*() {
+      yield* DecisionModel.decide(Gesture, { input: "Camera frame" })
+
+      assert.strictEqual(calls[0].images?.length, 2)
+      assert.strictEqual((calls[0].decisions as any).gesture.criteria.thumbs_up, "[image 1]")
+    }).pipe(Effect.provide(capture({ supportsImages: true }, calls)))
+  })
+
+  it.effect("passes inline images in place to models with inline support", () => {
+    const calls: Array<DecisionModel.ProviderOptions> = []
+    return Effect.gen(function*() {
+      yield* DecisionModel.decide(Gesture, { input: "Camera frame" })
+      yield* DecisionModel.decide(Gesture, { input: "Camera frame", images: [frame] })
+
+      assert.strictEqual(calls[0].decisions, Gesture.decisions)
+      assert.strictEqual(calls[0].images, undefined)
+      assert.deepStrictEqual(calls[1].images, [frame])
+    }).pipe(Effect.provide(capture({ supportsImages: true, supportsInlineImages: true }, calls)))
+  })
+
+  it.effect("leaves decisions untouched when they have no inline images", () => {
+    const calls: Array<DecisionModel.ProviderOptions> = []
+    return Effect.gen(function*() {
+      yield* DecisionModel.decide(TicketTriage, { input: ticket, images: [frame] })
+      assert.strictEqual(calls[0].decisions, TicketTriage.decisions)
+    }).pipe(Effect.provide(Layer.effect(
+      DecisionModel.DecisionModel,
+      DecisionModel.make({
+        supportsImages: true,
+        decide: (options) => {
+          calls.push(options)
+          return Effect.succeed({ answers: triageAnswers, usage: { inputTokens: undefined, outputTokens: undefined } })
+        }
+      })
+    )))
+  })
+
+  for (const supportsInlineImages of [undefined, true]) {
+    it.effect(`rejects inline images for models without image support (supportsInlineImages: ${supportsInlineImages})`, () =>
+      Effect.gen(function*() {
+        const error = yield* failureOf(DecisionModel.decide(Gesture, { input: "Camera frame" }))
+        assert.strictEqual(error?.reason._tag, "InvalidUserInputError")
+      }).pipe(Effect.provide(Layer.effect(
+        DecisionModel.DecisionModel,
+        DecisionModel.make({
+          supportsInlineImages,
+          decide: () => Effect.die("A text-only provider must not be called with images")
+        })
+      ))))
+  }
+})

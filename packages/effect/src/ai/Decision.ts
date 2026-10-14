@@ -8,6 +8,8 @@
  * @stability unstable
  * @since 4.0.0
  */
+import * as Base64 from "../encoding/Base64.ts"
+import * as Predicate from "../Predicate.ts"
 import type * as Schema from "../Schema.ts"
 
 /**
@@ -41,6 +43,38 @@ export const TypeId: TypeId = "~effect/ai/Decision"
  * @since 4.0.5
  */
 export type Description = string | Schema.JsonObject | Schema.JsonArray
+
+/**
+ * Property key that marks an {@link InlineImage}.
+ *
+ * @stability unstable
+ * @category type IDs
+ * @since 4.0.5
+ */
+export const InlineImageKey = "~effect/ai/Decision/InlineImage"
+
+/**
+ * An image placed inside instructions or criteria, such as an example picture
+ * for a classification label. Create it with {@link image}.
+ *
+ * **Details**
+ *
+ * An inline image is plain JSON, so it fits anywhere a {@link Description}
+ * does, including nested inside objects and arrays. Models created with
+ * `supportsInlineImages: true` receive it in place. For other image-capable
+ * models, `DecisionModel` moves it to the images sent with the input and
+ * leaves a `[image N]` reference in its place. Models without image support
+ * reject it.
+ *
+ * @stability unstable
+ * @category models
+ * @since 4.0.5
+ */
+export type InlineImage = {
+  readonly "~effect/ai/Decision/InlineImage":
+    | { readonly mediaType: string; readonly base64: string }
+    | { readonly mediaType: string; readonly url: string }
+}
 
 /**
  * Decision that assigns the input one label out of a set of criteria.
@@ -429,6 +463,99 @@ export const locate = (options: {
   _tag: "Locate",
   instructions: options.instructions
 })
+
+/**
+ * Creates an image to place inside instructions or criteria.
+ * Byte arrays are base64-encoded once, when the image is created.
+ *
+ * **Example** (Defining labels by example pictures)
+ *
+ * ```ts
+ * import { Decision } from "effect/ai"
+ *
+ * declare const thumbsUpPng: Uint8Array
+ * declare const openPalmPng: Uint8Array
+ *
+ * const gesture = Decision.classify({
+ *   instructions: "Which gesture is the hand in the photo making?",
+ *   criteria: {
+ *     thumbs_up: Decision.image({ mediaType: "image/png", data: thumbsUpPng }),
+ *     open_palm: {
+ *       description: "A hand held up with the palm facing the camera",
+ *       examples: [Decision.image({ mediaType: "image/png", data: openPalmPng })]
+ *     },
+ *     none: "No hand, or a gesture unlike the examples"
+ *   }
+ * })
+ * ```
+ *
+ * @see {@link InlineImage} for how models receive it
+ *
+ * @stability unstable
+ * @category constructors
+ * @since 4.0.5
+ */
+export const image = (options: {
+  readonly mediaType: string
+  readonly data: string | Uint8Array | URL
+}): InlineImage => ({
+  [InlineImageKey]: options.data instanceof URL
+    ? { mediaType: options.mediaType, url: options.data.href }
+    : {
+      mediaType: options.mediaType,
+      base64: typeof options.data === "string" ? options.data : Base64.encode(options.data)
+    }
+})
+
+/**
+ * Checks whether a value is an {@link InlineImage}.
+ *
+ * @stability unstable
+ * @category guards
+ * @since 4.0.5
+ */
+export const isInlineImage = (u: unknown): u is InlineImage => {
+  if (!Predicate.isObject(u) || Object.keys(u).length !== 1) return false
+  const image = u[InlineImageKey]
+  return Predicate.isObject(image) && Predicate.isString(image.mediaType) &&
+    (Predicate.isString(image.base64) || Predicate.isString(image.url))
+}
+
+/**
+ * Replaces every {@link InlineImage} in a description, at any depth, with the
+ * string returned by `f`. URL images are passed to `f` as `URL`s and others as
+ * base64 strings. Other values are copied unchanged.
+ *
+ * @stability unstable
+ * @category utils
+ * @since 4.0.5
+ */
+export const mapImages: {
+  (
+    description: Description,
+    f: (image: { readonly mediaType: string; readonly data: string | URL }) => string
+  ): Description
+  (
+    description: Description | null,
+    f: (image: { readonly mediaType: string; readonly data: string | URL }) => string
+  ): Description | null
+} = (
+  description: Description | null,
+  f: (image: { readonly mediaType: string; readonly data: string | URL }) => string
+): any => {
+  const go = (value: Schema.Json): Schema.Json => {
+    if (isInlineImage(value)) {
+      const image = value[InlineImageKey]
+      return f({ mediaType: image.mediaType, data: "url" in image ? new URL(image.url) : image.base64 })
+    }
+    if (Array.isArray(value)) return value.map(go)
+    if (Predicate.isObject(value)) {
+      return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, go(v as Schema.Json)]))
+    }
+    return value
+  }
+  return go(description)
+}
 
 /**
  * Creates a decision definition from an input schema and named decisions.

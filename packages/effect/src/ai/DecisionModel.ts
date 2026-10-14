@@ -10,7 +10,7 @@ import * as Effect from "../Effect.ts"
 import * as Predicate from "../Predicate.ts"
 import * as Schema from "../Schema.ts"
 import * as AiError from "./AiError.ts"
-import type * as Decision from "./Decision.ts"
+import * as Decision from "./Decision.ts"
 
 /**
  * Service key for answering decisions about an input. Create implementations
@@ -106,6 +106,8 @@ export interface DecideResponse<Decisions extends Record<string, Decision.Any>> 
  * All `decisions` must be answered in one call.
  * `images` is omitted when no images are supplied. Locate decisions reach
  * only providers created with `supportsLocate: true`, and always with images.
+ * Descriptions contain `Decision.InlineImage` values only for providers
+ * created with `supportsInlineImages: true`.
  *
  * @stability unstable
  * @category options
@@ -230,6 +232,75 @@ const invalidUserInput = (description: string): AiError.AiError =>
     method: "decide",
     reason: new AiError.InvalidUserInputError({ description })
   })
+
+const hasInlineImages = (decisions: Record<string, Decision.Any>): boolean => {
+  const go = (value: unknown): boolean =>
+    Decision.isInlineImage(value) ||
+    (Array.isArray(value) ? value.some(go) : Predicate.isObject(value) && Object.values(value).some(go))
+  return Object.values(decisions).some((decision) =>
+    go(decision.instructions) || (decision._tag !== "Locate" && go(decision.criteria))
+  )
+}
+
+const mapDescriptions = (
+  decisions: Record<string, Decision.Any>,
+  f: <A extends Decision.Description | null>(description: A) => A
+): Record<string, Decision.Any> => {
+  const mapped: Record<string, Decision.Any> = Object.create(null)
+  for (const [key, decision] of Object.entries(decisions)) {
+    const instructions = f(decision.instructions)
+    switch (decision._tag) {
+      case "Classify":
+        mapped[key] = {
+          ...decision,
+          instructions,
+          criteria: Object.fromEntries(Object.entries(decision.criteria).map(([label, d]) => [label, f(d)]))
+        }
+        break
+      case "Rate":
+        mapped[key] = {
+          ...decision,
+          instructions,
+          criteria: decision.criteria.map((level) => ({ label: level.label, description: f(level.description) }))
+        }
+        break
+      case "Probability":
+        mapped[key] = {
+          ...decision,
+          instructions,
+          criteria: decision.criteria && { false: f(decision.criteria.false), true: f(decision.criteria.true) }
+        }
+        break
+      case "Locate":
+        mapped[key] = { ...decision, instructions }
+        break
+    }
+  }
+  return mapped
+}
+
+/**
+ * Moves inline images after the call's images, replacing each with a
+ * `[image N]` reference counted from 1 across all images.
+ */
+const hoistInlineImages = (
+  decisions: Record<string, Decision.Any>,
+  images: ReadonlyArray<Image>
+): { readonly decisions: Record<string, Decision.Any>; readonly images: ReadonlyArray<Image> } => {
+  const all = [...images]
+  const indices = new Map<string, number>()
+  const mapped = mapDescriptions(decisions, (description) =>
+    Decision.mapImages(description, (image) => {
+      const key = `${image.mediaType} ${image.data instanceof URL ? image.data.href : image.data}`
+      let index = indices.get(key)
+      if (index === undefined) {
+        index = all.push(image) - 1
+        indices.set(key, index)
+      }
+      return `[image ${index + 1}]`
+    }) as typeof description)
+  return { decisions: mapped, images: all }
+}
 
 const isFiniteNumber = (value: unknown): value is number => Predicate.isNumber(value) && Number.isFinite(value)
 
@@ -393,6 +464,11 @@ const validateAnswers = <Decisions extends Record<string, Decision.Any>>(
  * Set `supportsImages: true` to accept images. Otherwise, nonempty image input
  * fails with `AiError.InvalidUserInputError`.
  *
+ * Inline images (`Decision.image`) in instructions or criteria count as
+ * images. Set `supportsInlineImages: true` to receive them in place.
+ * Otherwise, image-capable models receive them after the call's images, each
+ * replaced by a `[image N]` reference counted from 1 across all images.
+ *
  * Set `supportsLocate: true` to accept locate decisions. Otherwise, a
  * definition with a locate decision fails with `AiError.InvalidUserInputError`,
  * as does a locate decision without images.
@@ -414,6 +490,7 @@ export const make = (params: {
   readonly decide: (options: ProviderOptions) => Effect.Effect<ProviderResponse, AiError.AiError>
   readonly probabilityPrecision?: number | undefined
   readonly supportsImages?: boolean | undefined
+  readonly supportsInlineImages?: boolean | undefined
   readonly supportsLocate?: boolean | undefined
 }): Effect.Effect<DecisionModel> =>
   Effect.sync(() => {
@@ -433,8 +510,10 @@ export const make = (params: {
             })
           ),
           Effect.flatMap((state) => {
-            const images = options.images?.length ? options.images : undefined
-            if (images !== undefined && params.supportsImages !== true) {
+            let images = options.images?.length ? options.images : undefined
+            let decisions: Record<string, Decision.Any> = definition.decisions
+            const inline = hasInlineImages(decisions)
+            if ((images !== undefined || inline) && params.supportsImages !== true) {
               return Effect.fail(invalidUserInput("This decision model does not accept images"))
             }
             if (Object.values(definition.decisions).some((decision) => decision._tag === "Locate")) {
@@ -445,11 +524,10 @@ export const make = (params: {
                 return Effect.fail(invalidUserInput("Locate decisions need at least one image"))
               }
             }
-            return params.decide({
-              state,
-              decisions: definition.decisions,
-              ...(images === undefined ? undefined : { images })
-            })
+            if (inline && params.supportsInlineImages !== true) {
+              ;({ decisions, images } = hoistInlineImages(decisions, images ?? []))
+            }
+            return params.decide({ state, decisions, ...(images === undefined ? undefined : { images }) })
           }),
           Effect.flatMap((response) =>
             Effect.map(

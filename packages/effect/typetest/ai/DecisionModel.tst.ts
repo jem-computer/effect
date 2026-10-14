@@ -126,6 +126,21 @@ describe("Decision", () => {
     expect<Result["answers"]["present"]>().type.toBe<Decision.ProbabilityAnswer>()
   })
 
+  it("inline images fit anywhere a description does without widening Description", () => {
+    const thumb = Decision.image({ mediaType: "image/png", data: new Uint8Array() })
+    const gesture = Decision.classify({
+      instructions: ["Which gesture matches", thumb],
+      criteria: { thumbs_up: thumb, open_palm: { description: "Palm out", examples: [thumb] }, none: null }
+    })
+
+    expect(thumb).type.toBeAssignableTo<Decision.Description>()
+    expect(gesture).type.toBe<Decision.Classify<"thumbs_up" | "open_palm" | "none">>()
+    expect(Decision.rate({ instructions: "How open", criteria: [{ label: "fist", description: thumb }, "open"] }))
+      .type.toBe<Decision.Rate<"fist" | "open">>()
+    expect(Decision.mapImages(thumb, () => "ref")).type.toBe<Decision.Description>()
+    expect(Decision.mapImages(null, () => "ref")).type.toBe<Decision.Description | null>()
+  })
+
   it("probability accepts omitted criteria and preserves answer inference", () => {
     const urgent = Decision.probability({ instructions: "Needs action now" })
     const definition = Decision.make({

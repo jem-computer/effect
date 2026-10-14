@@ -5,13 +5,13 @@
  * @since 4.0.0
  */
 import * as AiError from "effect/ai/AiError"
+import * as Decision from "effect/ai/Decision"
 import * as DecisionModel from "effect/ai/DecisionModel"
 import * as AiModel from "effect/ai/Model"
 import * as Effect from "effect/Effect"
 import * as Base64 from "effect/encoding/Base64"
 import * as Layer from "effect/Layer"
 import * as Random from "effect/Random"
-import type * as Schema from "effect/Schema"
 import { TypeSafeClient } from "./TypeSafeClient.ts"
 import type * as TypeSafeSchema from "./TypeSafeSchema.ts"
 
@@ -47,8 +47,10 @@ export const model = (
  * placeholder per image in order. Instructions can name an image by path,
  * such as `` `images[0]` ``, and input fields as `` `input.subject` ``. Each
  * image is sent once as a base64 asset, and the request opts in to
- * TypeSafe's preview image support. Locate decisions become Box questions,
- * which need Jev 1.14 (`"jev-preview"` or `"jev-1.14.0"`).
+ * TypeSafe's preview image support. Inline images (`Decision.image`) in
+ * instructions or criteria are sent in place, each distinct image once.
+ * Locate decisions become Box questions, which need Jev 1.14
+ * (`"jev-preview"` or `"jev-1.14.0"`).
  *
  * **Gotchas**
  *
@@ -69,34 +71,70 @@ export const make = Effect.fnUntraced(
     return yield* DecisionModel.make({
       probabilityPrecision: 2,
       supportsImages: true,
+      supportsInlineImages: true,
       supportsLocate: true,
       decide: Effect.fnUntraced(function*({ state, decisions, images }) {
+        // TypeSafe replaces placeholders anywhere in the request's strings, so they must not occur in the input.
+        const nonce = Math.abs(yield* Random.nextInt).toString(36)
+        const pending: Array<DecisionModel.Image> = []
+        const addImage = (image: DecisionModel.Image) => `image-${pending.push(image) - 1}-${nonce}`
+        const inline = new Map<string, string>()
+        const describe = <A extends Decision.Description | null>(description: A): A =>
+          Decision.mapImages(description, (image) => {
+            const key = `${image.mediaType} ${image.data instanceof URL ? image.data.href : image.data}`
+            let placeholder = inline.get(key)
+            if (placeholder === undefined) {
+              placeholder = addImage(image)
+              inline.set(key, placeholder)
+            }
+            return placeholder
+          }) as A
+        const statePlaceholders = images?.map(addImage)
         const questions: Record<string, typeof TypeSafeSchema.Question.Encoded> = Object.create(null)
         for (const [key, decision] of Object.entries(decisions)) {
+          const instructions = describe(decision.instructions)
           switch (decision._tag) {
             case "Classify":
-              questions[key] = { type: "choice", instructions: decision.instructions, criteria: decision.criteria }
+              questions[key] = {
+                type: "choice",
+                instructions,
+                criteria: Object.fromEntries(
+                  Object.entries(decision.criteria).map(([label, d]) => [label, describe(d)])
+                )
+              }
               break
             case "Rate":
               questions[key] = {
                 type: "score",
-                instructions: decision.instructions,
-                criteria: decision.criteria.map((level) => level.description)
+                instructions,
+                criteria: decision.criteria.map((level) => describe(level.description))
               }
               break
             case "Probability":
-              questions[key] = { type: "noul", instructions: decision.instructions, criteria: decision.criteria }
+              questions[key] = {
+                type: "noul",
+                instructions,
+                criteria: decision.criteria && {
+                  false: describe(decision.criteria.false),
+                  true: describe(decision.criteria.true)
+                }
+              }
               break
             case "Locate":
-              questions[key] = { type: "box", instructions: decision.instructions }
+              questions[key] = { type: "box", instructions }
               break
           }
         }
-        const response = yield* client.systemOne(
-          images === undefined
-            ? { model: options.model, state, questions }
-            : { model: options.model, questions, ...yield* withImages(state, images) }
-        )
+        const assets: Record<string, typeof TypeSafeSchema.ImageAsset.Encoded> = Object.create(null)
+        for (const [index, image] of pending.entries()) {
+          assets[`image-${index}-${nonce}`] = yield* encodeImage(image)
+        }
+        const response = yield* client.systemOne({
+          model: options.model,
+          state: statePlaceholders === undefined ? state : { input: state, images: statePlaceholders },
+          questions,
+          ...(pending.length === 0 ? undefined : { assets })
+        })
         const answers: Record<string, DecisionModel.ProviderAnswer> = Object.create(null)
         for (const [key, decision] of Object.entries(decisions)) {
           const answer = response.answers[key]
@@ -135,18 +173,6 @@ export const make = Effect.fnUntraced(
     })
   }
 )
-
-const withImages = Effect.fnUntraced(function*(state: Schema.Json, images: ReadonlyArray<DecisionModel.Image>) {
-  const assets: Record<string, typeof TypeSafeSchema.ImageAsset.Encoded> = Object.create(null)
-  const placeholders: Array<string> = []
-  for (const image of images) {
-    // TypeSafe replaces placeholders anywhere in the request's strings, so they must not occur in the input.
-    const placeholder = `image-${placeholders.length}-${Math.abs(yield* Random.nextInt).toString(36)}`
-    assets[placeholder] = yield* encodeImage(image)
-    placeholders.push(placeholder)
-  }
-  return { state: { input: state, images: placeholders }, assets }
-})
 
 const encodeImage = (
   image: DecisionModel.Image

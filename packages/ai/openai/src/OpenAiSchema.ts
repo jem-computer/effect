@@ -1471,7 +1471,7 @@ export const DecisionQuestion = Schema.Union([
     type: Schema.Literal("choice"),
     name: Schema.String,
     instructions: Schema.String,
-    choices: Schema.Array(Schema.Struct({ value: Schema.String, description: Schema.String }))
+    choices: Schema.Array(Schema.Struct({ value: Schema.String, description: Schema.optionalKey(Schema.String) }))
   }),
   Schema.Struct({
     type: Schema.Literal("score"),

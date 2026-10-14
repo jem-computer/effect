@@ -46,8 +46,9 @@ export const model = (
  * URLs, and `data:` URLs are sent unchanged.
  *
  * Probability criteria are appended to the question instructions, and each
- * rating criterion is sent as both the label and the description of a score
- * level.
+ * rating level is sent with its label and description. Structured instructions
+ * and descriptions are sent as JSON text, the same way non-string state is. A
+ * choice with a `null` description is sent without one.
  *
  * **Gotchas**
  *
@@ -112,7 +113,7 @@ export const make = Effect.fnUntraced(
               const probabilities: Record<string, number> = Object.create(null)
               for (const { value, probability } of answer.probabilities) {
                 const level = decision.criteria[value]
-                if (level !== undefined) probabilities[level] = probability
+                if (level !== undefined) probabilities[level.label] = probability
               }
               answers[answer.name] = {
                 _tag: "Rate",
@@ -152,26 +153,33 @@ const encodeQuestion = (name: string, decision: Decision.Any): typeof OpenAiSche
       return {
         type: "choice",
         name,
-        instructions: decision.instructions,
-        choices: Object.entries(decision.criteria).map(([value, description]) => ({ value, description }))
+        instructions: toText(decision.instructions),
+        choices: Object.entries(decision.criteria).map(([value, description]) =>
+          description === null ? { value } : { value, description: toText(description) }
+        )
       }
     case "Rate":
       return {
         type: "score",
         name,
-        instructions: decision.instructions,
-        levels: decision.criteria.map((label) => ({ label, description: label }))
+        instructions: toText(decision.instructions),
+        levels: decision.criteria.map(({ description, label }) => ({ label, description: toText(description) }))
       }
-    case "Probability":
+    case "Probability": {
+      const instructions = toText(decision.instructions)
       return {
         type: "predicate",
         name,
         instructions: decision.criteria === undefined
-          ? decision.instructions
-          : `${decision.instructions}\n\nfalse: ${decision.criteria.false}\ntrue: ${decision.criteria.true}`
+          ? instructions
+          : `${instructions}\n\nfalse: ${toText(decision.criteria.false)}\ntrue: ${toText(decision.criteria.true)}`
       }
+    }
   }
 }
+
+const toText = (description: Decision.Description): string =>
+  typeof description === "string" ? description : JSON.stringify(description)
 
 const encodeImage = (image: DecisionModel.Image): string =>
   image.data instanceof URL

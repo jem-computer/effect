@@ -230,4 +230,149 @@ describe("OpenAiDecisionModel", () => {
       }))
     )
   })
+
+  describe("structured descriptions", () => {
+    // The pull request scope example from https://docs.typesafe.ai/primitives/advanced#structured-score-levels
+    const prScopeInstructions = {
+      question: "How focused is this pull request description on a single change?",
+      note: "Judge the number of independent changes, not the size of any one change."
+    }
+    const prScopeLevels = [
+      {
+        label: "focused",
+        description: {
+          summary: "One change, clearly stated",
+          signals: ["A single fix or feature", "Nothing described as \"also\" or \"while I was in there\""]
+        }
+      },
+      {
+        label: "tweak",
+        description: {
+          summary: "One main change plus a small related tweak",
+          signals: ["A primary change and one minor adjacent edit", "The tweak supports the main change"]
+        }
+      },
+      {
+        label: "bundled",
+        description: {
+          summary: "Several independent changes bundled together",
+          signals: ["Two or more unrelated fixes or features", "Changes that could each be their own PR"]
+        }
+      }
+    ] as const
+
+    it.effect("sends structured score instructions and levels as JSON text and maps answers to labels", () => {
+      const definition = Decision.make({
+        input: Schema.String,
+        decisions: { pr_scope: Decision.rate({ instructions: prScopeInstructions, criteria: prScopeLevels }) }
+      })
+      return Effect.gen(function*() {
+        const { answers } = yield* DecisionModel.decide(definition, { input: "Fixed the null check." })
+        assert.strictEqual(answers.pr_scope.label, "bundled")
+        assert.deepStrictEqual({ ...answers.pr_scope.probabilities }, { focused: 0.1, tweak: 0.2, bundled: 0.7 })
+      }).pipe(
+        Effect.provide(OpenAiDecisionModel.layer({ model: "gpt-6-luna" })),
+        Effect.provide(clientLayer(
+          response([{
+            name: "pr_scope",
+            type: "score",
+            score: 1.6,
+            probabilities: [
+              { value: 0, label: "focused", probability: 0.1 },
+              { value: 1, label: "tweak", probability: 0.2 },
+              { value: 2, label: "bundled", probability: 0.7 }
+            ],
+            confidence: 0.6
+          }]),
+          (request) => {
+            assert.deepStrictEqual(requestBody(request).questions, [{
+              type: "score",
+              name: "pr_scope",
+              instructions: JSON.stringify(prScopeInstructions),
+              levels: prScopeLevels.map(({ description, label }) => ({
+                label,
+                description: JSON.stringify(description)
+              }))
+            }])
+          }
+        ))
+      )
+    })
+
+    it.effect("omits the description of a choice whose description is null", () => {
+      const definition = Decision.make({
+        input: Schema.String,
+        decisions: {
+          customer_name: Decision.classify({
+            instructions: { question: "Which option is the customer name?" },
+            criteria: { "Beaver Dam Logistics": null, "Dam Logistics": null, other: ["Any", "other", "name"] }
+          })
+        }
+      })
+      return Effect.gen(function*() {
+        const { answers } = yield* DecisionModel.decide(definition, { input: "Invoice to Beaver Dam Logistics" })
+        assert.strictEqual(answers.customer_name.label, "Beaver Dam Logistics")
+      }).pipe(
+        Effect.provide(OpenAiDecisionModel.layer({ model: "gpt-6-luna" })),
+        Effect.provide(clientLayer(
+          response([{
+            name: "customer_name",
+            type: "choice",
+            choice: "Beaver Dam Logistics",
+            probabilities: [
+              { value: "Beaver Dam Logistics", probability: 0.9 },
+              { value: "Dam Logistics", probability: 0.1 },
+              { value: "other", probability: 0 }
+            ],
+            confidence: 0.9
+          }]),
+          (request) => {
+            assert.deepStrictEqual(requestBody(request).questions, [{
+              type: "choice",
+              name: "customer_name",
+              instructions: "{\"question\":\"Which option is the customer name?\"}",
+              choices: [
+                { value: "Beaver Dam Logistics" },
+                { value: "Dam Logistics" },
+                { value: "other", description: "[\"Any\",\"other\",\"name\"]" }
+              ]
+            }])
+          }
+        ))
+      )
+    })
+
+    it.effect("appends structured probability criteria to the instructions as JSON text", () => {
+      const instructions = { question: "Does the `message` ask for a credential?", inspect: "message" }
+      const criteria = {
+        false: { what: "No sensitive credential is requested", examples: ["Your statement is ready"] },
+        true: { what: "Asks for a password, PIN, or one-time code", examples: ["Reply with your password"] }
+      }
+      const definition = Decision.make({
+        input: Schema.String,
+        decisions: { requests_credentials: Decision.probability({ instructions, criteria }) }
+      })
+      return Effect.gen(function*() {
+        const { answers } = yield* DecisionModel.decide(definition, { input: "Reply with your login password." })
+        assert.strictEqual(answers.requests_credentials.probability, 0.97)
+      }).pipe(
+        Effect.provide(OpenAiDecisionModel.layer({ model: "gpt-6-luna" })),
+        Effect.provide(clientLayer(
+          response([{ name: "requests_credentials", type: "predicate", probability: 0.97 }]),
+          (request) => {
+            assert.deepStrictEqual(requestBody(request).questions, [{
+              type: "predicate",
+              name: "requests_credentials",
+              instructions: [
+                JSON.stringify(instructions),
+                "",
+                `false: ${JSON.stringify(criteria.false)}`,
+                `true: ${JSON.stringify(criteria.true)}`
+              ].join("\n")
+            }])
+          }
+        ))
+      )
+    })
+  })
 })
